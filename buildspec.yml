@@ -1,0 +1,86 @@
+version: 0.2
+env:
+  parameter-store:
+    GITHUB_PAT: "/ecs/github/PAT"
+  variables:
+    APP_DIR: "src"
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22
+    commands:
+      - set -e
+      - echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Phases] Installing dependencies..."
+      - cd "$APP_DIR"
+      - echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Phases] Configuring npm for GitHub Packages..."
+      - |
+        echo "@hkt-backend-dev:registry=https://npm.pkg.github.com" > ~/.npmrc
+        echo "//npm.pkg.github.com/:_authToken=$GITHUB_PAT" >> ~/.npmrc
+      - echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Phases] Installing Node.js dependencies..."
+      - npm install
+      - echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Phases] Checking for jq installation..."
+      - command -v jq >/dev/null 2>&1 || { echo "Installing jq..."; yum install -y jq; }
+      - echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Phases] Returning to repository root..."
+      - cd ..
+  pre_build:
+    commands:
+      - echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Pre Build] Starting pre-build phase..."
+      - |
+        set -e
+        PR_EVENTS=("PULL_REQUEST_CREATED" "PULL_REQUEST_UPDATED" "PULL_REQUEST_REOPENED")
+        if [[ " ${PR_EVENTS[*]} " =~ " ${CODEBUILD_WEBHOOK_EVENT} " ]]; then
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Pre Build] Detected PR event: $CODEBUILD_WEBHOOK_EVENT"
+          cd "$APP_DIR"
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Pre Build] Running Jest tests..."
+          npm test -- --verbose || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Pre Build] Jest tests failed. Check the logs for details." >&2
+            exit 1
+          }
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Pre Build] All tests passed successfully"
+        fi
+      - |
+        if [ "$CODEBUILD_WEBHOOK_EVENT" == "PUSH" ]; then
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Pre Build] Skipping Jest tests for event: $CODEBUILD_WEBHOOK_EVENT"
+        fi
+      - echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Pre Build] Pre-build phase completed"
+  build:
+    commands:
+      - echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Build] Starting build phase..."
+      - |
+        set -e
+        if [ "$CODEBUILD_WEBHOOK_EVENT" != "PUSH" ]; then
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Build] Skipping Docker build for event: $CODEBUILD_WEBHOOK_EVENT"
+        else
+          # ECR Login and image tag preparation
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Build] Preparing for ECS deployment..."
+          aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+          COMMIT_HASH=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c 1-7)
+          IMAGE_TAG="${COMMIT_HASH:-latest}"
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Build] Building Docker image with tag: $IMAGE_TAG..."
+          docker build --secret id=npmrc,src=$HOME/.npmrc -t "$ECR_REPO_NAME:$IMAGE_TAG" -f ./src/Dockerfile ./src
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Build] Tagging Docker images..."
+          docker tag "$ECR_REPO_NAME:$IMAGE_TAG" "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO_NAME:$IMAGE_TAG"
+          docker tag "$ECR_REPO_NAME:$IMAGE_TAG" "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO_NAME:latest"
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Build] Pushing Docker images to ECR..."
+          docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO_NAME:$IMAGE_TAG"
+          docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO_NAME:latest"
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Build] Docker image push completed successfully"
+        fi
+  post_build:
+    commands:
+      - echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Post Build] Starting post-build phase..."
+      - |
+        set -e
+        if [ "$CODEBUILD_WEBHOOK_EVENT" != "PUSH" ]; then
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Post Build] Skipping ECS update for event: $CODEBUILD_WEBHOOK_EVENT"
+        else
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Post Build] Updating ECS task definition..."
+          sed -i "s/{AWS_ACCOUNT_ID}/$AWS_ACCOUNT_ID/g" ecsTaskDef.json
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Post Build] Registering new ECS task definition..."
+          jq --color-output . ecsTaskDef.json | less -R 
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://ecsTaskDef.json --region $AWS_DEFAULT_REGION | jq -r '.taskDefinition.taskDefinitionArn')
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Post Build] Updating ECS service with task definition: $NEW_TASK_DEF_ARN..."
+          aws ecs update-service --cluster $ECS_CLUSTER_NAME --service $ECS_SERVICE_NAME --task-definition $NEW_TASK_DEF_ARN --force-new-deployment --region $AWS_DEFAULT_REGION
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Post Build] ECS service update completed successfully"
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [Post Build] Build and deployment completed successfully"
+        fi
