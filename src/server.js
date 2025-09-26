@@ -1,9 +1,13 @@
-
 import express from 'express';
 const app = express();
 
 // Middleware to parse JSON request bodies
 app.use(express.json());
+
+// Health check route for target group
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
 
 // POST endpoint handler
 app.post('/api', (req, res) => {
